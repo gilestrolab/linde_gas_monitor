@@ -1,0 +1,19 @@
+#version: '3'
+
+services:
+  linde_monitor:
+    container_name: linde_monitor
+    build: .
+    environment:
+      - VIRTUAL_HOST=linde.lab.gilest.ro
+      - VIRTUAL_PORT=8000
+    volumes:
+      - ./data:/etc/linde
+    expose:
+      - "8000"
+    restart: always
+
+networks:
+  default:
+    name: nginx-proxy
+    external: true
