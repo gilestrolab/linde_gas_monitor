@@ -356,13 +356,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                     <td>Left</td>
                     <td style="{left_color}">{left_content} {left_icon}</td>
                     <td style="{left_message_time_color}">{left_message_time_formatted}</td>
-                    <td style="{left_last_change_color}">{left_last_change_formatted}</td>
+                    <td>{left_last_change_formatted}</td>
                 </tr>
                 <tr>
                     <td>Right</td>
                     <td style="{right_color}">{right_content} {right_icon}</td>
                     <td style="{right_message_time_color}">{right_message_time_formatted}</td>
-                    <td style="{right_last_change_color}">{right_last_change_formatted}</td>
+                    <td>{right_last_change_formatted}</td>
                 </tr>
             </table>
             <div class="center">
@@ -376,14 +376,14 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 
 
-    def generate_plot(self, resampling_value='3H'):
+    def generate_plot(self, resampling_value='3H', days=10):
         # Load data from CSV log file
         df = pd.read_csv(link.log_file, parse_dates=['messageTime'])
 
         # Filter data for the past 7 days
         now = datetime.now()
-        one_week_ago = now - timedelta(days=7)
-        df_filtered = df[df['messageTime'] >= one_week_ago]
+        time_window = now - timedelta(days=days)
+        df_filtered = df[df['messageTime'] >= time_window]
         
         # Ensure 'content' column is numeric
         df_filtered['content'] = pd.to_numeric(df_filtered['content'], errors='coerce')
@@ -435,8 +435,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         labels = labels0 + labels1 + ['Alert Sent']
         fig.legend(handles=handles, labels=labels, loc='lower center', ncol=3)  # Move legend to bottom
 
-        axs[0].set_title('Bank Contents for the Past 7 Days')
+        axs[0].set_title(f"Bank Contents for the Past {days} Days")
 
+        plt.xlim(time_window, now)  # Ensure x-axis limits are set correctly
         plt.tight_layout(rect=[0, 0.1, 1, 0.95])  # Adjust layout to make space for the legend at the bottom
         plt.savefig('plot.png')
         plt.close()
