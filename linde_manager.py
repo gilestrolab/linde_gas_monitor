@@ -176,12 +176,13 @@ class LindeLink():
 
     def start_data_collection(self):
         self.get_data()
-        threading.Timer(3600, self.start_data_collection).start()  # Schedule to run every hour
+        threading.Timer(3600, self.start_data_collection).start()  # Scheduled to run every hour
 
     def send_alert_email(self, bank):
         msg = MIMEMultipart()
         msg['From'] = self.credentials['username']
         msg['To'] = self.credentials['BOC_address']
+        msg['CC'] = self.credentials['username']
         msg['Subject'] = "Please deliver 40-VK to the cage between SECB and Flowers."
         
         body = (f"Dear BOC team,\n\n"
@@ -312,11 +313,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         right_icon = get_icon(right_content)
 
         # Read the last alert date and time
-        last_alert_time = 'No alerts sent yet'
+        last_alert_message = 'No alerts sent yet'
         last_alert_file = os.path.join(_DATADIR, 'last_alert.log')
         if os.path.exists(last_alert_file):
             with open(last_alert_file, 'r') as file:
-                last_alert_time = file.read().strip()
+                lines = file.readlines()
+                last_entry = lines[-1].strip()  # Get the latest entry
+                last_alert_time, bank_side = last_entry.split(',')  # Split the entry into time and bank side
+                last_alert_message = f"The last alert was sent on {last_alert_time} for the {bank_side} bank"
+
 
         html = f"""
         <html>
@@ -344,7 +349,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         </head>
         <body>
             <h2 class="center">FlyRoom CO2 Bank Status</h2>
-            <p class="center">Last alert sent: {last_alert_time}</p>
+            <p class="center">{last_alert_message}</p>
             <table>
                 <tr>
                     <th>Bank</th>
