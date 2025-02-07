@@ -1,16 +1,15 @@
-#version: '3'
-
+---
 services:
   linde_monitor:
     container_name: linde_monitor
     build: .
     environment:
       - VIRTUAL_HOST=linde.lab.gilest.ro
-      - VIRTUAL_PORT=8000
+      - VIRTUAL_PORT=8084
     volumes:
       - ./data:/etc/linde
-    expose:
-      - "8000"
+    ports:
+      - 8084:8084
     restart: always
 
 networks:

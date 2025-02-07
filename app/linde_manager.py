@@ -17,23 +17,23 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import optparse
 
+_DEFAULT_PORT=8000
+
 class LindeLink():
-    def __init__(self):
+    def __init__(self, debug=False):
         self.bearer_token = None
         self.data = {}
 
         # Ensure the data directory exists
         if not os.path.exists(_DATADIR):
             os.makedirs(_DATADIR)
+        self.log_file = os.path.join(_DATADIR, 'data_log.csv')
 
         self.load_credentials()
         self.setup_logging()
         self.get_bearer_token()
 
     def setup_logging(self):
-        self.log_file = os.path.join(_DATADIR, 'data_log.csv')
-        log_dir = os.path.dirname(self.log_file)
-
         # Ensure the log file has a header if it doesn't exist
         if not os.path.exists(self.log_file) or os.path.getsize(self.log_file) == 0:
             with open(self.log_file, 'w') as file:
@@ -179,29 +179,42 @@ class LindeLink():
         threading.Timer(3600, self.start_data_collection).start()  # Scheduled to run every hour
 
     def send_alert_email(self, bank):
-        msg = MIMEMultipart()
-        msg['From'] = self.credentials['username']
-        msg['To'] = self.credentials['BOC_address']
-        msg['CC'] = self.credentials['username']
-        msg['Subject'] = "Please deliver 40-VK to the cage between SECB and Flowers."
-        
-        body = (f"Dear BOC team,\n\n"
-                "Please deliver 2x 40-VK cylinders to the cage space between SEC and FLOWERS building, SKEN. "
-                f"To be charged on Service PO Number: {self.credentials['PO']}.\n"
-                f"Please collect the two empty cylinders on the {bank} bank.\n\n"
-                "Many thanks,\n"
-                "Giorgio Gilestro")
-        msg.attach(MIMEText(body, 'plain'))
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = msg['Cc'] = self.credentials['smtp_sender']
+            msg['To'] = self.credentials['smtp_recipient']
+            msg['Subject'] = "Please deliver 40-VK to the cage between SECB and Flowers."
+            
+            body = (f"Dear BOC team,\n\n"
+                    "Please deliver 2x 40-VK cylinders to the cage space between SEC and FLOWERS building, SKEN. "
+                    f"To be charged on Service PO Number: {self.credentials['PO']}.\n"
+                    f"Please collect the two empty cylinders on the {bank} bank.\n\n"
+                    "Many thanks,\n"
+                    "Giorgio Gilestro")
+            msg.attach(MIMEText(body, 'plain'))
 
-        # Establish SMTP connection and send the email
-        with smtplib.SMTP(self.credentials['smtp_server'], self.credentials['smtp_port']) as server:
-            server.sendmail(self.credentials['username'], self.credentials['BOC_address'], msg.as_string())
-            print(f"Alert email sent to {self.credentials['BOC_address']} for {bank} bank.")
+            with smtplib.SMTP_SSL(self.credentials['smtp_server'], self.credentials['smtp_port'], timeout=10) as server:
+                if eval(self.credentials['use_auth']):
+                    #server.starttls()
+                    logging.info("Authenticating to SMTP server")
+                    server.login(self.credentials['smtp_username'], self.credentials['smtp_password'])
 
-        # Log the last alert date and time with bank
-        self.last_alert_time = datetime.now().strftime('%Y-%m-%d %H:%M')
-        with open(os.path.join(_DATADIR, 'last_alert.log'), 'a') as file:
-            file.write(f"{self.last_alert_time},{bank}\n")
+                # Sending to both To and Cc recipients
+                recipients = [msg['To'], msg['Cc']]
+                server.sendmail(self.credentials['smtp_sender'], recipients, msg.as_string())
+                logging.info(f"Alert email sent to {msg['To']} and cc'd {msg['Cc']} for {bank} bank.")
+
+                # Log the last alert date and time with bank
+                self.last_alert_time = datetime.now().strftime('%Y-%m-%d %H:%M')
+                with open(os.path.join(_DATADIR, 'last_alert.log'), 'a') as file:
+                    file.write(f"{self.last_alert_time},{bank}\n")
+
+        except smtplib.SMTPException as e:
+            logging.error(f"SMTP error occurred while sending email for {bank} bank: {e}")
+
+        except Exception as e:
+            logging.error(f"Unexpected error occurred while sending email for {bank} bank: {e}")
+
 
     def check_and_send_alert(self, bank):
         alert_sent = False
@@ -384,22 +397,25 @@ class RequestHandler(BaseHTTPRequestHandler):
     def generate_plot(self, resampling_value='3H', days=10):
         # Load data from CSV log file
         df = pd.read_csv(link.log_file, parse_dates=['messageTime'])
+        df['messageTime'] = pd.to_datetime(df['messageTime'], errors='coerce')
 
         # Filter data for the past 7 days
         now = datetime.now()
         time_window = now - timedelta(days=days)
         df_filtered = df[df['messageTime'] >= time_window]
-        
+
         # Ensure 'content' column is numeric
+        df_filtered = df_filtered.copy()
         df_filtered['content'] = pd.to_numeric(df_filtered['content'], errors='coerce')
 
         # Separate left and right banks
         df_left = df_filtered[df_filtered['bank'] == 'left'].set_index('messageTime')
         df_right = df_filtered[df_filtered['bank'] == 'right'].set_index('messageTime')
 
-        # Interpolate data
-        df_left_interpolated = df_left.interpolate(method='time')
-        df_right_interpolated = df_right.interpolate(method='time')
+        # Ensure that 'content' column is a valid numeric type for interpolation
+        # Then Interpolate data
+        df_left_interpolated = df_left.infer_objects(copy=False).interpolate(method='time')
+        df_right_interpolated = df_right.infer_objects(copy=False).interpolate(method='time')
 
         # Read the last alert dates and times
         alert_times = {'left': [], 'right': []}
@@ -452,7 +468,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 
 
-def run_server(server_class=HTTPServer, handler_class=RequestHandler, port=8000):
+def run_server(server_class=HTTPServer, handler_class=RequestHandler, port=_DEFAULT_PORT):
     server_address = ('', port)
     httpd = server_class(server_address, handler_class)
     print(f'Starting httpd server on port {port}')
@@ -463,14 +479,29 @@ if __name__ == '__main__':
     parser = optparse.OptionParser()
     parser.add_option("-p", "--path", dest="path", default="./data/", help="Set the path to the data folder")
     parser.add_option("--notify", dest="notify", default=False, help="Notify via email", action="store_true")
-    parser.add_option("--port", dest="port", default=8000, help="Port for the webserver")
+    parser.add_option("--port", dest="port", default=_DEFAULT_PORT, help="Port for the webserver")
+    parser.add_option("--debug", dest="debug", default=False, help="Enable debug logging", action="store_true")
 
     (options, args) = parser.parse_args()
+
+    # Configure logging based on debug option
+    if options.debug:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(message)s',
+            stream=os.sys.stdout
+        )
+    else:
+        logging.basicConfig(
+            level=logging.ERROR,
+            format='%(message)s',
+            stream=os.sys.stdout
+        )
 
     option_dict = vars(options)
     _DATADIR = option_dict["path"]
     _ALERT = option_dict["notify"]
-    _PORT = option_dict["port"]
+    _PORT = int(option_dict["port"])
 
     link = LindeLink()
     link.start_data_collection()
