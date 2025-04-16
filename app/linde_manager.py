@@ -17,7 +17,10 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import optparse
 
-_DEFAULT_PORT=8000
+_DEFAULT_PORT = 8000
+_DATADIR = "./data/"
+_ALERT = False
+
 
 class LindeLink():
     def __init__(self, debug=False):
@@ -163,12 +166,15 @@ class LindeLink():
                 file.write(f"{json_dict.get('messageTimeLeft')},left,{json_dict.get('lastChangeLeft')},{json_dict.get('leftBankContents')}\n")
                 file.write(f"{json_dict.get('messageTimeRight')},right,{json_dict.get('lastChangeRight')},{json_dict.get('rightBankContents')}\n")
  
-             # Check for low content and send alert email if needed
+            # Check for low content and send alert email if needed
             
             if int(json_dict.get('leftBankContents', 0)) <= 10 and _ALERT:
                 self.check_and_send_alert('left')
             if int(json_dict.get('rightBankContents', 0)) <= 10 and _ALERT:
                 self.check_and_send_alert('right')
+
+            # Check for no data transfer and send alert email if needed
+            self.check_message_time_freshness()
 
             return json_dict
         else:
@@ -176,13 +182,112 @@ class LindeLink():
 
     def start_data_collection(self):
         self.get_data()
+        
+        # Check for stale data even if get_data() fails
+        if self.data:
+            self.check_message_time_freshness()
+        
         threading.Timer(3600, self.start_data_collection).start()  # Scheduled to run every hour
 
-    def send_alert_email(self, bank):
+    def check_message_time_freshness(self):
+        """
+        Check if the messageTime for either bank is older than 3 days.
+        If so, send an alert email to the configured smtp_sender.
+        """
+        current_time = datetime.now()
+        alert_sent = False
+        
+        # Check left bank message time
+        if 'messageTimeLeft' in self.data:
+            try:
+                left_time = datetime.strptime(self.data['messageTimeLeft'], '%Y-%m-%dT%H:%M:%S')
+                delta_left = current_time - left_time
+                
+                if delta_left.days > 3:
+                    self.send_data_staleness_alert('left', delta_left.days)
+                    alert_sent = True
+            except (ValueError, TypeError):
+                logging.error(f"Error parsing left bank message time: {self.data.get('messageTimeLeft')}")
+        
+        # Check right bank message time
+        if 'messageTimeRight' in self.data:
+            try:
+                right_time = datetime.strptime(self.data['messageTimeRight'], '%Y-%m-%dT%H:%M:%S')
+                delta_right = current_time - right_time
+                
+                if delta_right.days > 3:
+                    # Only send second alert if it's not the same general issue
+                    if not alert_sent:
+                        self.send_data_staleness_alert('right', delta_right.days)
+                    # If we already sent an alert for left bank, let's add right bank to the log
+                    elif alert_sent:
+                        with open(os.path.join(_DATADIR, 'staleness_alert.log'), 'a') as file:
+                            file.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M')},right,{delta_right.days}\n")
+            except (ValueError, TypeError):
+                logging.error(f"Error parsing right bank message time: {self.data.get('messageTimeRight')}")
+
+    def send_data_staleness_alert(self, bank, days_old):
+        """
+        Send an alert email when data is stale (more than 3 days old).
+        
+        Args:
+            bank: The bank (left/right) with stale data
+            days_old: Number of days since the last data update
+        """
+        # Check if we've already sent an alert in the last 24 hours
+        alert_sent = False
+        alert_log_file = os.path.join(_DATADIR, 'staleness_alert.log')
+        
+        if os.path.exists(alert_log_file):
+            with open(alert_log_file, 'r') as file:
+                for line in file:
+                    last_time_str, last_bank, _ = line.strip().split(',')
+                    last_time = datetime.strptime(last_time_str, '%Y-%m-%d %H:%M')
+                    if (datetime.now() - last_time) < timedelta(hours=24):
+                        alert_sent = True
+                        break
+        
+        if not alert_sent:
+            try:
+                msg = MIMEMultipart()
+                msg['From'] = self.credentials['smtp_sender']
+                msg['To'] = self.credentials['smtp_sender']  # Send to the sender as requested
+                msg['Subject'] = "ALERT: CO2 Bank Data Staleness"
+                
+                body = (f"Dear Administrator,\n\n"
+                        f"The CO2 bank monitoring system has detected stale data for the {bank} bank.\n"
+                        f"The last data update was {days_old} days ago.\n\n"
+                        f"This may indicate a connectivity issue with the Linde Digital Manifold system.\n"
+                        f"Please check the system connection and authentication.\n\n"
+                        f"This is an automated message from the CO2 Bank Monitoring System.")
+                
+                msg.attach(MIMEText(body, 'plain'))
+                
+                with smtplib.SMTP(self.credentials['smtp_server'], self.credentials['smtp_port'], timeout=10) as server:
+                    if eval(self.credentials['use_auth']):
+                        logging.info("Authenticating to SMTP server")
+                        server.login(self.credentials['smtp_username'], self.credentials['smtp_password'])
+                    
+                    server.sendmail(self.credentials['smtp_sender'], [self.credentials['smtp_sender']], msg.as_string())
+                    logging.info(f"Data staleness alert email sent to {self.credentials['smtp_sender']} for {bank} bank.")
+                    
+                    # Log the alert
+                    with open(alert_log_file, 'a') as file:
+                        file.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M')},{bank},{days_old}\n")
+                    
+            except Exception as e:
+                logging.error(f"Error sending data staleness alert: {e}")
+
+    def send_alert_email(self, bank, test=False):
         try:
             msg = MIMEMultipart()
             msg['From'] = msg['Cc'] = self.credentials['smtp_sender']
-            msg['To'] = self.credentials['smtp_recipient']
+
+            if test:
+                msg['To'] = self.credentials['smtp_sender']
+            else:
+                msg['To'] = self.credentials['smtp_recipient']
+
             msg['Subject'] = "Please deliver 40-VK to the cage between SECB and Flowers."
             
             body = (f"Dear BOC team,\n\n"
@@ -193,7 +298,7 @@ class LindeLink():
                     "Giorgio Gilestro")
             msg.attach(MIMEText(body, 'plain'))
 
-            with smtplib.SMTP_SSL(self.credentials['smtp_server'], self.credentials['smtp_port'], timeout=10) as server:
+            with smtplib.SMTP(self.credentials['smtp_server'], self.credentials['smtp_port'], timeout=10) as server:
                 if eval(self.credentials['use_auth']):
                     #server.starttls()
                     logging.info("Authenticating to SMTP server")
@@ -255,7 +360,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'image/png')
             self.end_headers()
             self.generate_plot()
-            with open('plot.png', 'rb') as file:
+            plot_path = os.path.join(_DATADIR, 'plot.png')
+            with open(plot_path, 'rb') as file:
                 self.wfile.write(file.read())
         else:
             self.send_response(404)
@@ -460,12 +566,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         plt.xlim(time_window, now)  # Ensure x-axis limits are set correctly
         plt.tight_layout(rect=[0, 0.1, 1, 0.95])  # Adjust layout to make space for the legend at the bottom
-        plt.savefig('plot.png')
+        plot_path = os.path.join(_DATADIR, 'plot.png')
+        plt.savefig(plot_path)
         plt.close()
-
-
-
-
 
 
 def run_server(server_class=HTTPServer, handler_class=RequestHandler, port=_DEFAULT_PORT):
