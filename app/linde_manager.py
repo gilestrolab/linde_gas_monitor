@@ -463,14 +463,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     background-color: #f2f2f2;
                 }}
                 .center {{ text-align: center; }}
-                footer {
+                footer {{
                     text-align: center;
                     margin-top: 50px;
                     padding: 10px;
                     border-top: 1px solid #dddddd;
                     font-size: 14px;
                     width: 100%;
-                }
+                }}
             </style>
             <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
         </head>
