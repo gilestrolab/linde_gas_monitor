@@ -463,6 +463,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     background-color: #f2f2f2;
                 }}
                 .center {{ text-align: center; }}
+                footer {
+                    text-align: center;
+                    margin-top: 50px;
+                    padding: 10px;
+                    border-top: 1px solid #dddddd;
+                    font-size: 14px;
+                    width: 100%;
+                }
             </style>
             <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
         </head>
@@ -492,7 +500,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             <div class="center">
                 <img src="/plot" alt="Bank Contents Plot">
             </div>
-            <footer>
+            <footer class="center">
                 CO<sub>2</sub> bank for the Dept of Life Sciences Fly Room - Imperial College London - <a href="https://dfs.linde.com/main/dashboard">Linde Dashboard</a>
             </footer>
         </body>
