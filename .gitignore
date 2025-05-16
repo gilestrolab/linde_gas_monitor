@@ -1,3 +1,6 @@
 credentials.json
 *.log
 *.csv
+credentials.mailu.json
+credentials.json
+*.png
