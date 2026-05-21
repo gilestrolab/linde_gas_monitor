@@ -366,16 +366,17 @@ class LindeLink():
             logging.error(f"No valid PO available to send alert for {bank} bank.")
             return
         po_number = po.get('number', 'N/A')
-        po_email = po.get('email') or self.credentials.get('smtp_recipient')
 
         try:
             msg = MIMEMultipart()
             msg['From'] = msg['Cc'] = self.credentials['smtp_sender']
 
+            # Supplier address is shared across POs; the PO's own email
+            # belongs to the PI paying the bill and is informational only.
             if test:
                 msg['To'] = self.credentials['smtp_sender']
             else:
-                msg['To'] = po_email
+                msg['To'] = self.credentials['smtp_recipient']
 
             msg['Subject'] = "Please deliver 40-VK to the cage between SECB and Flowers."
 
@@ -597,11 +598,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         next_po = link.select_po()
         next_number = next_po['number'] if next_po else None
 
+        def format_amount(value):
+            if value is None:
+                return '—'
+            if isinstance(value, (int, float)):
+                return f'£{value:,.0f}' if float(value).is_integer() else f'£{value:,.2f}'
+            return str(value)
+
         rows = ''
         for po in link.pos:
             number = po.get('number', 'N/A')
             email = po.get('email') or '—'
             ratio = po.get('ratio', 1)
+            initial_amount = format_amount(po.get('initial_amount'))
             created = po.get('created') or '—'
             expires = po.get('expires')
 
@@ -621,6 +630,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 f'<td>{number}{marker}</td>'
                 f'<td>{email}</td>'
                 f'<td>{ratio}</td>'
+                f'<td>{initial_amount}</td>'
                 f'<td>{usage.get(number, 0)}</td>'
                 f'<td>{created}</td>'
                 f'<td style="{expires_style}">{expires_display}</td>'
@@ -628,19 +638,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
 
         if not rows:
-            rows = '<tr><td colspan="6" class="center">No purchase orders configured.</td></tr>'
+            rows = '<tr><td colspan="7" class="center">No purchase orders configured.</td></tr>'
 
         return f"""
         <h2 class="center">Purchase Orders</h2>
         <p class="center"><small>Each alert email picks the PO with the lowest
         used / ratio score among non-expired entries, so over time usage
         converges to the configured ratios. The &#9733; marks the PO that will
-        be used next.</small></p>
+        be used next. Reference email is the PI funding the order
+        (informational); all delivery requests go to the supplier address
+        configured in credentials.json.</small></p>
         <table>
             <tr>
                 <th>PO Number</th>
-                <th>Reference Email</th>
+                <th>Reference Email (PI)</th>
                 <th>Ratio</th>
+                <th>Initial Amount</th>
                 <th>Used</th>
                 <th>Created</th>
                 <th>Expires</th>

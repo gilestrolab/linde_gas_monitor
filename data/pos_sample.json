@@ -1,16 +1,18 @@
 {
     "pos": [
         {
-            "number": "PO12345",
-            "email": "supplier-a@example.com",
+            "number": "4800971",
+            "email": "g.gilestro@imperial.ac.uk",
             "ratio": 1,
-            "created": "2025-01-01",
-            "expires": "2026-12-31"
+            "initial_amount": 500,
+            "created": "2026-02-01",
+            "expires": "2027-01-31"
         },
         {
             "number": "PO67890",
-            "email": "supplier-b@example.com",
+            "email": "another.pi@imperial.ac.uk",
             "ratio": 2,
+            "initial_amount": 1000,
             "created": "2025-06-01",
             "expires": "2027-06-01"
         }

@@ -126,3 +126,30 @@ def test_select_po_handles_invalid_expiry(make_link):
         {'number': 'PO-A', 'ratio': 1, 'expires': 'not-a-date'},
     ])
     assert link.select_po()['number'] == 'PO-A'
+
+
+# ---------- initial_amount: passed through to the PO record and rendered ----------
+
+def test_initial_amount_preserved_on_load(make_link):
+    link = make_link(pos=[
+        {'number': 'PO-A', 'email': 'pi@x', 'ratio': 1,
+         'initial_amount': 500, 'expires': '2099-12-31'},
+    ])
+    assert link.pos[0]['initial_amount'] == 500
+
+
+def test_initial_amount_rendered_in_pos_tab(make_link):
+    """The Initial Amount column should appear and integer values render as £NNN."""
+    import linde_manager
+    link = make_link(pos=[
+        {'number': 'PO-A', 'email': 'pi@x', 'ratio': 1,
+         'initial_amount': 500, 'expires': '2099-12-31'},
+        {'number': 'PO-NOAMT', 'email': 'pi2@x', 'ratio': 1,
+         'expires': '2099-12-31'},
+    ])
+    class HStub: pass
+    html = linde_manager.RequestHandler.render_pos_tab(HStub())
+    assert '<th>Initial Amount</th>' in html
+    assert '£500' in html
+    # POs without an initial amount should render an em-dash, not "None"
+    assert '>None<' not in html
