@@ -366,19 +366,16 @@ class LindeLink():
         if not alert_sent:
             self.send_alert_email(bank)
 
-    def get_recent_orders(self, n=10):
+    def get_orders_history(self):
         """
-        Read last_alert.log and return the most recent orders plus per-bank
+        Read last_alert.log and return the full order history plus per-bank
         statistics, so unusually short gaps between orders (a leak indicator)
         can be highlighted in the dashboard.
-
-        Args:
-            n (int): Maximum number of recent orders to return.
 
         Returns:
             tuple: (orders, median_interval) where
                 orders is a list of (datetime, bank, days_since_previous_same_bank)
-                sorted oldest-first (the last n entries),
+                sorted oldest-first,
                 median_interval is a dict {'left': float|None, 'right': float|None}
                 holding the median days between consecutive orders for each bank,
                 computed over the full history.
@@ -428,7 +425,7 @@ class LindeLink():
             enriched.append((dt, bank, days_since))
             last_seen[bank] = dt
 
-        return enriched[-n:], median_interval
+        return enriched, median_interval
 
     def check_email_connection(self):
         """
@@ -477,7 +474,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/':
             self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
             self.wfile.write(self.generate_html().encode('utf-8'))
         elif self.path == '/status':
@@ -507,6 +504,135 @@ class RequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def render_orders_timeline(self, window_days=365):
+        """
+        Render the order history of the past `window_days` as an inline SVG
+        timeline. Left-bank orders sit above the axis, right-bank below; each
+        marker is colored by how short the gap to the previous same-bank order
+        is, relative to that bank's median (a short gap is the leading
+        indicator of a slow leak).
+
+        Args:
+            window_days (int): Size of the displayed time window in days.
+
+        Returns:
+            str: HTML fragment containing the SVG and a colour legend, or an
+            empty string if there is nothing to show.
+        """
+        all_orders, median_interval = link.get_orders_history()
+        if not all_orders:
+            return ''
+
+        now = datetime.now()
+        start = now - timedelta(days=window_days)
+        visible = [(dt, bank, days) for dt, bank, days in all_orders if dt >= start]
+        if not visible:
+            return ''
+
+        # SVG geometry
+        width, height = 820, 160
+        m_left, m_right, m_top, m_bottom = 55, 20, 20, 40
+        plot_w = width - m_left - m_right
+        plot_h = height - m_top - m_bottom
+        axis_y = m_top + plot_h / 2
+        total_span = (now - start).total_seconds()
+
+        def x_for(dt):
+            frac = (dt - start).total_seconds() / total_span
+            return m_left + frac * plot_w
+
+        def color_for(days_since, bank):
+            median = median_interval.get(bank)
+            if days_since is None:
+                return '#888888'  # first recorded order — no comparison
+            if median is None:
+                return '#1f77b4'
+            ratio = days_since / median
+            if ratio < 0.5:
+                return '#D0342C'  # red — likely leak
+            if ratio < 0.75:
+                return '#F68C70'  # orange — faster than usual
+            return '#3CA055'      # green — at or near baseline
+
+        # Month tick marks and labels along the axis
+        ticks = []
+        cur = datetime(start.year, start.month, 1)
+        if cur < start:
+            cur = datetime(cur.year + (cur.month == 12), 1 if cur.month == 12 else cur.month + 1, 1)
+        while cur <= now:
+            x = x_for(cur)
+            ticks.append(
+                f'<line x1="{x:.1f}" y1="{axis_y - 4}" x2="{x:.1f}" y2="{axis_y + 4}" stroke="#aaa" />'
+            )
+            label = cur.strftime('%b %y') if cur.month == 1 else cur.strftime('%b')
+            ticks.append(
+                f'<text x="{x:.1f}" y="{axis_y + plot_h / 2 + 14}" '
+                f'text-anchor="middle" font-size="11" fill="#555">{label}</text>'
+            )
+            cur = datetime(cur.year + (cur.month == 12), 1 if cur.month == 12 else cur.month + 1, 1)
+
+        # Bank-side labels
+        side_labels = [
+            f'<text x="{m_left - 8}" y="{axis_y - 14}" text-anchor="end" '
+            f'dominant-baseline="middle" font-size="11" fill="#555">Left</text>',
+            f'<text x="{m_left - 8}" y="{axis_y + 14}" text-anchor="end" '
+            f'dominant-baseline="middle" font-size="11" fill="#555">Right</text>',
+        ]
+
+        # Order markers
+        markers = []
+        for dt, bank, days_since in visible:
+            x = x_for(dt)
+            cy = axis_y - 14 if bank == 'left' else axis_y + 14
+            color = color_for(days_since, bank)
+            median = median_interval.get(bank)
+            if days_since is None:
+                detail = f"first recorded {bank}-bank order"
+            else:
+                ratio_str = f", {days_since / median * 100:.0f}% of {median:.0f}d median" if median else ""
+                detail = f"{days_since:.1f}d since previous {bank}-bank order{ratio_str}"
+            tooltip = f"{dt.strftime('%Y-%m-%d %H:%M')} | {bank} bank | {detail}"
+            markers.append(
+                f'<circle cx="{x:.1f}" cy="{cy:.1f}" r="5" fill="{color}" '
+                f'stroke="#333" stroke-width="0.5"><title>{tooltip}</title></circle>'
+            )
+
+        axis_line = (
+            f'<line x1="{m_left}" y1="{axis_y}" x2="{m_left + plot_w}" y2="{axis_y}" '
+            f'stroke="#666" stroke-width="1" />'
+        )
+
+        left_med = median_interval.get('left')
+        right_med = median_interval.get('right')
+        left_med_str = f"{left_med:.1f} days" if left_med is not None else 'N/A'
+        right_med_str = f"{right_med:.1f} days" if right_med is not None else 'N/A'
+
+        svg = (
+            f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+            f'style="max-width:100%;height:auto;">'
+            f'{axis_line}'
+            f'{"".join(ticks)}'
+            f'{"".join(side_labels)}'
+            f'{"".join(markers)}'
+            f'</svg>'
+        )
+
+        return f"""
+        <div class="timeline-container">
+            <h3>Orders over the past {window_days // 30} months</h3>
+            <p><small>Median interval between same-bank orders &mdash;
+            Left: {left_med_str}, Right: {right_med_str}.
+            Hover a dot for details.</small></p>
+            {svg}
+            <div class="timeline-legend">
+                <span><i class="dot" style="background:#D0342C"></i>&lt; 50% of median (likely leak)</span>
+                <span><i class="dot" style="background:#F68C70"></i>50&ndash;75% of median</span>
+                <span><i class="dot" style="background:#3CA055"></i>&ge; 75% of median</span>
+                <span><i class="dot" style="background:#888888"></i>first recorded</span>
+            </div>
+        </div>
+        """
 
     def generate_html(self):
         # Generate the current status table
@@ -582,51 +708,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 last_alert_time, bank_side = last_entry.split(',')  # Split the entry into time and bank side
                 last_alert_message = f"The last alert was sent on {last_alert_time} for the {bank_side} bank"
 
-        # Recent orders table — short same-bank gaps may indicate a leak
-        recent_orders, median_interval = link.get_recent_orders(10)
-
-        def get_interval_color(days, median):
-            if days is None or median is None:
-                return ''
-            if days < median * 0.5:
-                return 'background-color: #D0342C;'  # pastel red — likely leak
-            if days < median * 0.75:
-                return 'background-color: #F68C70;'  # pastel orange — faster than usual
-            return ''
-
-        if recent_orders:
-            orders_rows = ''
-            for dt, bank, days_since in reversed(recent_orders):  # newest first
-                median = median_interval.get(bank)
-                color = get_interval_color(days_since, median)
-                days_str = f"{days_since:.1f} days" if days_since is not None else 'N/A'
-                orders_rows += (
-                    f'<tr><td>{dt.strftime("%Y-%m-%d %H:%M")}</td>'
-                    f'<td>{bank}</td>'
-                    f'<td style="{color}">{days_str}</td></tr>'
-                )
-
-            left_median = median_interval.get('left')
-            right_median = median_interval.get('right')
-            left_median_str = f"{left_median:.1f} days" if left_median is not None else 'N/A'
-            right_median_str = f"{right_median:.1f} days" if right_median is not None else 'N/A'
-
-            orders_html = f"""
-            <h3 class="center">Recent Orders (last {len(recent_orders)})</h3>
-            <p class="center"><small>Median interval between same-bank orders &mdash;
-            Left: {left_median_str}, Right: {right_median_str}.
-            Orders placed unusually soon after the previous one may indicate a leak.</small></p>
-            <table>
-                <tr>
-                    <th>Date</th>
-                    <th>Bank</th>
-                    <th>Days since previous order (same bank)</th>
-                </tr>
-                {orders_rows}
-            </table>
-            """
-        else:
-            orders_html = ''
+        # Orders timeline (past 12 months) — short same-bank gaps may indicate a leak
+        orders_html = self.render_orders_timeline(window_days=365)
 
 
         # Check if email connection has problems
@@ -695,6 +778,29 @@ class RequestHandler(BaseHTTPRequestHandler):
                     background-color: #f2f2f2;
                 }}
                 .center {{ text-align: center; }}
+                .timeline-container {{
+                    max-width: 820px;
+                    margin: 30px auto 10px;
+                    text-align: center;
+                }}
+                .timeline-container svg circle {{ cursor: help; }}
+                .timeline-legend {{
+                    display: flex;
+                    justify-content: center;
+                    gap: 18px;
+                    flex-wrap: wrap;
+                    font-size: 12px;
+                    margin-top: 10px;
+                    color: #555;
+                }}
+                .timeline-legend .dot {{
+                    display: inline-block;
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 50%;
+                    vertical-align: middle;
+                    margin-right: 5px;
+                }}
                 footer {{
                     text-align: center;
                     margin-top: 50px;
