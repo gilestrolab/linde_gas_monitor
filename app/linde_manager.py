@@ -26,6 +26,7 @@ class LindeLink():
     def __init__(self, debug=False):
         self.bearer_token = None
         self.data = {}
+        self.email_status = {'connected': True, 'last_check': None, 'error': None}
 
         # Ensure the data directory exists
         if not os.path.exists(_DATADIR):
@@ -35,6 +36,7 @@ class LindeLink():
         self.load_credentials()
         self.setup_logging()
         self.get_bearer_token()
+        self.check_email_connection()
 
     def setup_logging(self):
         # Ensure the log file has a header if it doesn't exist
@@ -270,13 +272,25 @@ class LindeLink():
                     
                     server.sendmail(self.credentials['smtp_sender'], [self.credentials['smtp_sender']], msg.as_string())
                     logging.info(f"Data staleness alert email sent to {self.credentials['smtp_sender']} for {bank} bank.")
-                    
+
+                    # Update email status to indicate successful send
+                    self.email_status = {
+                        'connected': True,
+                        'last_check': datetime.now(),
+                        'error': None
+                    }
+
                     # Log the alert
                     with open(alert_log_file, 'a') as file:
                         file.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M')},{bank},{days_old}\n")
                     
             except Exception as e:
                 logging.error(f"Error sending data staleness alert: {e}")
+                self.email_status = {
+                    'connected': False,
+                    'last_check': datetime.now(),
+                    'error': f"Error: {str(e)}"
+                }
 
     def send_alert_email(self, bank, test=False):
         try:
@@ -309,6 +323,13 @@ class LindeLink():
                 server.sendmail(self.credentials['smtp_sender'], recipients, msg.as_string())
                 logging.info(f"Alert email sent to {msg['To']} and cc'd {msg['Cc']} for {bank} bank.")
 
+                # Update email status to indicate successful send
+                self.email_status = {
+                    'connected': True,
+                    'last_check': datetime.now(),
+                    'error': None
+                }
+
                 # Log the last alert date and time with bank
                 self.last_alert_time = datetime.now().strftime('%Y-%m-%d %H:%M')
                 with open(os.path.join(_DATADIR, 'last_alert.log'), 'a') as file:
@@ -316,9 +337,19 @@ class LindeLink():
 
         except smtplib.SMTPException as e:
             logging.error(f"SMTP error occurred while sending email for {bank} bank: {e}")
+            self.email_status = {
+                'connected': False,
+                'last_check': datetime.now(),
+                'error': f"SMTP error: {str(e)}"
+            }
 
         except Exception as e:
             logging.error(f"Unexpected error occurred while sending email for {bank} bank: {e}")
+            self.email_status = {
+                'connected': False,
+                'last_check': datetime.now(),
+                'error': f"Error: {str(e)}"
+            }
 
 
     def check_and_send_alert(self, bank):
@@ -334,6 +365,111 @@ class LindeLink():
                         break
         if not alert_sent:
             self.send_alert_email(bank)
+
+    def get_recent_orders(self, n=10):
+        """
+        Read last_alert.log and return the most recent orders plus per-bank
+        statistics, so unusually short gaps between orders (a leak indicator)
+        can be highlighted in the dashboard.
+
+        Args:
+            n (int): Maximum number of recent orders to return.
+
+        Returns:
+            tuple: (orders, median_interval) where
+                orders is a list of (datetime, bank, days_since_previous_same_bank)
+                sorted oldest-first (the last n entries),
+                median_interval is a dict {'left': float|None, 'right': float|None}
+                holding the median days between consecutive orders for each bank,
+                computed over the full history.
+        """
+        last_alert_file = os.path.join(_DATADIR, 'last_alert.log')
+        median_interval = {'left': None, 'right': None}
+        if not os.path.exists(last_alert_file):
+            return [], median_interval
+
+        orders = []
+        with open(last_alert_file, 'r') as file:
+            for line in file:
+                parts = line.strip().split(',')
+                if len(parts) != 2:
+                    continue
+                try:
+                    dt = datetime.strptime(parts[0], '%Y-%m-%d %H:%M')
+                except ValueError:
+                    continue
+                orders.append((dt, parts[1]))
+        orders.sort(key=lambda x: x[0])
+
+        # Median interval per bank over the full history.
+        # Reason: per-bank median is the right baseline because each bank is
+        # consumed independently, so a leak shows up as a short same-bank gap.
+        by_bank = {'left': [], 'right': []}
+        for dt, bank in orders:
+            if bank in by_bank:
+                by_bank[bank].append(dt)
+        for bank, dates in by_bank.items():
+            if len(dates) < 2:
+                continue
+            intervals = sorted((dates[i] - dates[i - 1]).total_seconds() / 86400
+                               for i in range(1, len(dates)))
+            mid = len(intervals) // 2
+            if len(intervals) % 2 == 0:
+                median_interval[bank] = (intervals[mid - 1] + intervals[mid]) / 2
+            else:
+                median_interval[bank] = intervals[mid]
+
+        # Annotate each order with days since the previous same-bank order.
+        enriched = []
+        last_seen = {}
+        for dt, bank in orders:
+            prev = last_seen.get(bank)
+            days_since = (dt - prev).total_seconds() / 86400 if prev else None
+            enriched.append((dt, bank, days_since))
+            last_seen[bank] = dt
+
+        return enriched[-n:], median_interval
+
+    def check_email_connection(self):
+        """
+        Test the SMTP connection and update email_status.
+        This method attempts to connect to the SMTP server to verify email functionality.
+        """
+        try:
+            with smtplib.SMTP(self.credentials['smtp_server'], self.credentials['smtp_port'], timeout=10) as server:
+                if eval(self.credentials['use_auth']):
+                    server.login(self.credentials['smtp_username'], self.credentials['smtp_password'])
+
+                self.email_status = {
+                    'connected': True,
+                    'last_check': datetime.now(),
+                    'error': None
+                }
+                logging.info("Email connection test successful")
+
+        except smtplib.SMTPAuthenticationError as e:
+            self.email_status = {
+                'connected': False,
+                'last_check': datetime.now(),
+                'error': f"Authentication failed: {str(e)}"
+            }
+            logging.error(f"Email authentication error: {e}")
+
+        except smtplib.SMTPConnectError as e:
+            self.email_status = {
+                'connected': False,
+                'last_check': datetime.now(),
+                'error': f"Connection failed: {str(e)}"
+            }
+            logging.error(f"Email connection error: {e}")
+
+        except Exception as e:
+            self.email_status = {
+                'connected': False,
+                'last_check': datetime.now(),
+                'error': f"Error: {str(e)}"
+            }
+            logging.error(f"Email connection test failed: {e}")
 
 
 
@@ -352,7 +488,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 'leftBankContents': link.data.get('leftBankContents'),
                 'rightBankContents': link.data.get('rightBankContents'),
                 'messageTimeLeft': link.data.get('messageTimeLeft'),
-                'messageTimeRight': link.data.get('messageTimeRight')
+                'messageTimeRight': link.data.get('messageTimeRight'),
+                'emailStatus': {
+                    'connected': link.email_status['connected'],
+                    'lastCheck': link.email_status['last_check'].isoformat() if link.email_status['last_check'] else None,
+                    'error': link.email_status['error']
+                }
             }
             self.wfile.write(json.dumps(response).encode('utf-8'))
         elif self.path == '/plot':
@@ -441,6 +582,71 @@ class RequestHandler(BaseHTTPRequestHandler):
                 last_alert_time, bank_side = last_entry.split(',')  # Split the entry into time and bank side
                 last_alert_message = f"The last alert was sent on {last_alert_time} for the {bank_side} bank"
 
+        # Recent orders table — short same-bank gaps may indicate a leak
+        recent_orders, median_interval = link.get_recent_orders(10)
+
+        def get_interval_color(days, median):
+            if days is None or median is None:
+                return ''
+            if days < median * 0.5:
+                return 'background-color: #D0342C;'  # pastel red — likely leak
+            if days < median * 0.75:
+                return 'background-color: #F68C70;'  # pastel orange — faster than usual
+            return ''
+
+        if recent_orders:
+            orders_rows = ''
+            for dt, bank, days_since in reversed(recent_orders):  # newest first
+                median = median_interval.get(bank)
+                color = get_interval_color(days_since, median)
+                days_str = f"{days_since:.1f} days" if days_since is not None else 'N/A'
+                orders_rows += (
+                    f'<tr><td>{dt.strftime("%Y-%m-%d %H:%M")}</td>'
+                    f'<td>{bank}</td>'
+                    f'<td style="{color}">{days_str}</td></tr>'
+                )
+
+            left_median = median_interval.get('left')
+            right_median = median_interval.get('right')
+            left_median_str = f"{left_median:.1f} days" if left_median is not None else 'N/A'
+            right_median_str = f"{right_median:.1f} days" if right_median is not None else 'N/A'
+
+            orders_html = f"""
+            <h3 class="center">Recent Orders (last {len(recent_orders)})</h3>
+            <p class="center"><small>Median interval between same-bank orders &mdash;
+            Left: {left_median_str}, Right: {right_median_str}.
+            Orders placed unusually soon after the previous one may indicate a leak.</small></p>
+            <table>
+                <tr>
+                    <th>Date</th>
+                    <th>Bank</th>
+                    <th>Days since previous order (same bank)</th>
+                </tr>
+                {orders_rows}
+            </table>
+            """
+        else:
+            orders_html = ''
+
+
+        # Check if email connection has problems
+        email_alert_html = ''
+        if not link.email_status['connected']:
+            error_msg = link.email_status.get('error', 'Unknown error')
+            last_check = link.email_status.get('last_check')
+            if last_check:
+                last_check_str = last_check.strftime('%Y-%m-%d %H:%M')
+            else:
+                last_check_str = 'Never'
+
+            email_alert_html = f"""
+            <div class="email-alert">
+                <i class="fa fa-exclamation-triangle"></i>
+                <strong>Email Connection Problem!</strong>
+                <p>Email alerts are currently not working. Last check: {last_check_str}</p>
+                <p class="error-detail">Error: {error_msg}</p>
+            </div>
+            """
 
         html = f"""
         <html>
@@ -448,6 +654,32 @@ class RequestHandler(BaseHTTPRequestHandler):
             <title>Bank Status and Plot</title>
             <style>
                 body {{ font-family: Arial, sans-serif; }}
+                .email-alert {{
+                    background-color: #ff9999;
+                    border: 2px solid #cc0000;
+                    border-radius: 5px;
+                    padding: 15px;
+                    margin: 20px auto;
+                    max-width: 600px;
+                    text-align: center;
+                }}
+                .email-alert i {{
+                    color: #cc0000;
+                    font-size: 24px;
+                    margin-right: 10px;
+                }}
+                .email-alert strong {{
+                    color: #cc0000;
+                    font-size: 18px;
+                }}
+                .email-alert p {{
+                    margin: 5px 0;
+                }}
+                .email-alert .error-detail {{
+                    font-size: 12px;
+                    color: #660000;
+                    font-style: italic;
+                }}
                 table {{
                     width: 50%;
                     max-width: 600px;
@@ -476,6 +708,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         </head>
         <body>
             <h2 class="center">FlyRoom CO<sub>2</sub> Bank Status</h2>
+            {email_alert_html}
             <p class="center">{last_alert_message}</p>
             <table>
                 <tr>
@@ -497,6 +730,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     <td>{right_last_change_formatted}</td>
                 </tr>
             </table>
+            {orders_html}
             <div class="center">
                 <img src="/plot" alt="Bank Contents Plot">
             </div>
