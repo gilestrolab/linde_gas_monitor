@@ -32,11 +32,79 @@ class LindeLink():
         if not os.path.exists(_DATADIR):
             os.makedirs(_DATADIR)
         self.log_file = os.path.join(_DATADIR, 'data_log.csv')
+        self.last_alert_file = os.path.join(_DATADIR, 'last_alert.log')
 
         self.load_credentials()
+        self.load_pos()
         self.setup_logging()
         self.get_bearer_token()
         self.check_email_connection()
+
+    def load_pos(self):
+        """
+        Load purchase orders from pos.json. Each PO has number, email, ratio,
+        and optional created/expires dates. If pos.json is absent, synthesize
+        a single-entry list from credentials.json so existing setups keep
+        working unchanged.
+        """
+        pos_file = os.path.join(_DATADIR, 'pos.json')
+        if os.path.exists(pos_file):
+            with open(pos_file, 'r') as file:
+                data = json.load(file)
+                self.pos = data.get('pos', [])
+        else:
+            self.pos = [{
+                'number': self.credentials.get('PO', 'N/A'),
+                'email': self.credentials.get('smtp_recipient', ''),
+                'ratio': 1,
+                'created': None,
+                'expires': None,
+            }]
+
+    def get_po_usage(self):
+        """
+        Count past uses of each configured PO from last_alert.log. Only lines
+        recorded with the new 3-column format contribute; legacy 2-column
+        lines are ignored (no PO recorded at that time).
+        """
+        usage = {po['number']: 0 for po in self.pos}
+        if not os.path.exists(self.last_alert_file):
+            return usage
+        with open(self.last_alert_file, 'r') as file:
+            for line in file:
+                parts = line.strip().split(',')
+                if len(parts) >= 3 and parts[2] in usage:
+                    usage[parts[2]] += 1
+        return usage
+
+    def select_po(self):
+        """
+        Pick the next PO to use by weighted round-robin: among non-expired POs
+        with ratio > 0, choose the one whose used_count / ratio is smallest,
+        so over time usage converges to the configured ratios.
+
+        Returns:
+            dict | None: The chosen PO, or None if no PO is currently usable.
+        """
+        today = datetime.now().date()
+
+        def is_valid(po):
+            if po.get('ratio', 1) <= 0:
+                return False
+            expires = po.get('expires')
+            if not expires:
+                return True
+            try:
+                return datetime.strptime(expires, '%Y-%m-%d').date() >= today
+            except ValueError:
+                return True
+
+        candidates = [po for po in self.pos if is_valid(po)]
+        if not candidates:
+            return None
+
+        usage = self.get_po_usage()
+        return min(candidates, key=lambda po: usage.get(po['number'], 0) / po.get('ratio', 1))
 
     def setup_logging(self):
         # Ensure the log file has a header if it doesn't exist
@@ -293,6 +361,13 @@ class LindeLink():
                 }
 
     def send_alert_email(self, bank, test=False):
+        po = self.select_po()
+        if po is None:
+            logging.error(f"No valid PO available to send alert for {bank} bank.")
+            return
+        po_number = po.get('number', 'N/A')
+        po_email = po.get('email') or self.credentials.get('smtp_recipient')
+
         try:
             msg = MIMEMultipart()
             msg['From'] = msg['Cc'] = self.credentials['smtp_sender']
@@ -300,13 +375,13 @@ class LindeLink():
             if test:
                 msg['To'] = self.credentials['smtp_sender']
             else:
-                msg['To'] = self.credentials['smtp_recipient']
+                msg['To'] = po_email
 
             msg['Subject'] = "Please deliver 40-VK to the cage between SECB and Flowers."
-            
+
             body = (f"Dear BOC team,\n\n"
                     "Please deliver 2x 40-VK cylinders to the cage space between SEC and FLOWERS building, SKEN. "
-                    f"To be charged on Service PO Number: {self.credentials['PO']}.\n"
+                    f"To be charged on Service PO Number: {po_number}.\n"
                     f"Please collect the two empty cylinders on the {bank} bank.\n\n"
                     "Many thanks,\n"
                     "Giorgio Gilestro")
@@ -330,10 +405,10 @@ class LindeLink():
                     'error': None
                 }
 
-                # Log the last alert date and time with bank
+                # Log the alert with bank and PO so usage drives future rotation
                 self.last_alert_time = datetime.now().strftime('%Y-%m-%d %H:%M')
-                with open(os.path.join(_DATADIR, 'last_alert.log'), 'a') as file:
-                    file.write(f"{self.last_alert_time},{bank}\n")
+                with open(self.last_alert_file, 'a') as file:
+                    file.write(f"{self.last_alert_time},{bank},{po_number}\n")
 
         except smtplib.SMTPException as e:
             logging.error(f"SMTP error occurred while sending email for {bank} bank: {e}")
@@ -354,11 +429,13 @@ class LindeLink():
 
     def check_and_send_alert(self, bank):
         alert_sent = False
-        last_alert_file = os.path.join(_DATADIR, 'last_alert.log')
-        if os.path.exists(last_alert_file):
-            with open(last_alert_file, 'r') as file:
+        if os.path.exists(self.last_alert_file):
+            with open(self.last_alert_file, 'r') as file:
                 for line in file:
-                    last_time_str, last_bank = line.strip().split(',')
+                    parts = line.strip().split(',')
+                    if len(parts) < 2:
+                        continue
+                    last_time_str, last_bank = parts[0], parts[1]
                     last_time = datetime.strptime(last_time_str, '%Y-%m-%d %H:%M')
                     if last_bank == bank and (datetime.now() - last_time) < timedelta(hours=72):
                         alert_sent = True
@@ -389,7 +466,7 @@ class LindeLink():
         with open(last_alert_file, 'r') as file:
             for line in file:
                 parts = line.strip().split(',')
-                if len(parts) != 2:
+                if len(parts) < 2:
                     continue
                 try:
                     dt = datetime.strptime(parts[0], '%Y-%m-%d %H:%M')
@@ -504,6 +581,73 @@ class RequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def render_pos_tab(self):
+        """
+        Render the Purchase Orders tab: each configured PO with its reference
+        email, ratio, cumulative usage count, and create/expire dates. Expired
+        rows are highlighted, and the next PO that select_po() would return is
+        flagged so the rotation is visible at a glance.
+
+        Returns:
+            str: HTML fragment for the POs tab.
+        """
+        today = datetime.now().date()
+        usage = link.get_po_usage()
+        next_po = link.select_po()
+        next_number = next_po['number'] if next_po else None
+
+        rows = ''
+        for po in link.pos:
+            number = po.get('number', 'N/A')
+            email = po.get('email') or '—'
+            ratio = po.get('ratio', 1)
+            created = po.get('created') or '—'
+            expires = po.get('expires')
+
+            expires_style = ''
+            expires_display = expires or '—'
+            if expires:
+                try:
+                    if datetime.strptime(expires, '%Y-%m-%d').date() < today:
+                        expires_style = 'background-color: #D0342C; color: white;'
+                        expires_display = f"{expires} (expired)"
+                except ValueError:
+                    pass
+
+            marker = ' <span title="Next PO in rotation" style="color:#3CA055;">&#9733;</span>' if number == next_number else ''
+            rows += (
+                f'<tr>'
+                f'<td>{number}{marker}</td>'
+                f'<td>{email}</td>'
+                f'<td>{ratio}</td>'
+                f'<td>{usage.get(number, 0)}</td>'
+                f'<td>{created}</td>'
+                f'<td style="{expires_style}">{expires_display}</td>'
+                f'</tr>'
+            )
+
+        if not rows:
+            rows = '<tr><td colspan="6" class="center">No purchase orders configured.</td></tr>'
+
+        return f"""
+        <h2 class="center">Purchase Orders</h2>
+        <p class="center"><small>Each alert email picks the PO with the lowest
+        used / ratio score among non-expired entries, so over time usage
+        converges to the configured ratios. The &#9733; marks the PO that will
+        be used next.</small></p>
+        <table>
+            <tr>
+                <th>PO Number</th>
+                <th>Reference Email</th>
+                <th>Ratio</th>
+                <th>Used</th>
+                <th>Created</th>
+                <th>Expires</th>
+            </tr>
+            {rows}
+        </table>
+        """
 
     def render_orders_timeline(self, window_days=365):
         """
@@ -705,11 +849,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             with open(last_alert_file, 'r') as file:
                 lines = file.readlines()
                 last_entry = lines[-1].strip()  # Get the latest entry
-                last_alert_time, bank_side = last_entry.split(',')  # Split the entry into time and bank side
-                last_alert_message = f"The last alert was sent on {last_alert_time} for the {bank_side} bank"
+                parts = last_entry.split(',')
+                if len(parts) >= 2:
+                    last_alert_time, bank_side = parts[0], parts[1]
+                    last_alert_message = f"The last alert was sent on {last_alert_time} for the {bank_side} bank"
 
         # Orders timeline (past 12 months) — short same-bank gaps may indicate a leak
         orders_html = self.render_orders_timeline(window_days=365)
+
+        # Purchase Orders tab content
+        pos_html = self.render_pos_tab()
 
 
         # Check if email connection has problems
@@ -801,6 +950,32 @@ class RequestHandler(BaseHTTPRequestHandler):
                     vertical-align: middle;
                     margin-right: 5px;
                 }}
+                .tabs {{
+                    display: flex;
+                    justify-content: center;
+                    margin: 20px 0 0;
+                    gap: 4px;
+                    border-bottom: 1px solid #dddddd;
+                }}
+                .tab-btn {{
+                    background: #f2f2f2;
+                    border: 1px solid #dddddd;
+                    border-bottom: none;
+                    padding: 8px 18px;
+                    cursor: pointer;
+                    font-size: 14px;
+                    border-radius: 4px 4px 0 0;
+                    color: #333;
+                }}
+                .tab-btn:hover {{ background: #e8e8e8; }}
+                .tab-btn.active {{
+                    background: #ffffff;
+                    font-weight: bold;
+                    position: relative;
+                    top: 1px;
+                }}
+                .tab-pane {{ display: none; }}
+                .tab-pane.active {{ display: block; }}
                 footer {{
                     text-align: center;
                     margin-top: 50px;
@@ -815,34 +990,53 @@ class RequestHandler(BaseHTTPRequestHandler):
         <body>
             <h2 class="center">FlyRoom CO<sub>2</sub> Bank Status</h2>
             {email_alert_html}
-            <p class="center">{last_alert_message}</p>
-            <table>
-                <tr>
-                    <th>Bank</th>
-                    <th>Contents</th>
-                    <th>Message Time</th>
-                    <th>Last Change</th>
-                </tr>
-                <tr>
-                    <td>Left</td>
-                    <td style="{left_color}">{left_content} {left_icon}</td>
-                    <td style="{left_message_time_color}">{left_message_time_formatted}</td>
-                    <td>{left_last_change_formatted}</td>
-                </tr>
-                <tr>
-                    <td>Right</td>
-                    <td style="{right_color}">{right_content} {right_icon}</td>
-                    <td style="{right_message_time_color}">{right_message_time_formatted}</td>
-                    <td>{right_last_change_formatted}</td>
-                </tr>
-            </table>
-            {orders_html}
-            <div class="center">
-                <img src="/plot" alt="Bank Contents Plot">
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="status">Status</button>
+                <button class="tab-btn" data-tab="pos">Purchase Orders</button>
+            </div>
+            <div id="tab-status" class="tab-pane active">
+                <p class="center">{last_alert_message}</p>
+                <table>
+                    <tr>
+                        <th>Bank</th>
+                        <th>Contents</th>
+                        <th>Message Time</th>
+                        <th>Last Change</th>
+                    </tr>
+                    <tr>
+                        <td>Left</td>
+                        <td style="{left_color}">{left_content} {left_icon}</td>
+                        <td style="{left_message_time_color}">{left_message_time_formatted}</td>
+                        <td>{left_last_change_formatted}</td>
+                    </tr>
+                    <tr>
+                        <td>Right</td>
+                        <td style="{right_color}">{right_content} {right_icon}</td>
+                        <td style="{right_message_time_color}">{right_message_time_formatted}</td>
+                        <td>{right_last_change_formatted}</td>
+                    </tr>
+                </table>
+                {orders_html}
+                <div class="center">
+                    <img src="/plot" alt="Bank Contents Plot">
+                </div>
+            </div>
+            <div id="tab-pos" class="tab-pane">
+                {pos_html}
             </div>
             <footer class="center">
                 CO<sub>2</sub> bank for the Dept of Life Sciences Fly Room - Imperial College London - <a href="https://dfs.linde.com/main/dashboard">Linde Dashboard</a>
             </footer>
+            <script>
+                document.querySelectorAll('.tab-btn').forEach(function (btn) {{
+                    btn.addEventListener('click', function () {{
+                        document.querySelectorAll('.tab-btn').forEach(function (b) {{ b.classList.remove('active'); }});
+                        document.querySelectorAll('.tab-pane').forEach(function (p) {{ p.classList.remove('active'); }});
+                        btn.classList.add('active');
+                        document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+                    }});
+                }});
+            </script>
         </body>
         </html>
         """
@@ -880,9 +1074,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         if os.path.exists(last_alert_file):
             with open(last_alert_file, 'r') as file:
                 for line in file:
-                    last_time_str, last_bank = line.strip().split(',')
+                    parts = line.strip().split(',')
+                    if len(parts) < 2:
+                        continue
+                    last_time_str, last_bank = parts[0], parts[1]
                     last_time = datetime.strptime(last_time_str, '%Y-%m-%d %H:%M')
-                    alert_times[last_bank].append(last_time)
+                    if last_bank in alert_times:
+                        alert_times[last_bank].append(last_time)
 
         # Create a figure with two subplots
         fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)

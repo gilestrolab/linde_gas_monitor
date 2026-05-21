@@ -1,0 +1,18 @@
+{
+    "pos": [
+        {
+            "number": "PO12345",
+            "email": "supplier-a@example.com",
+            "ratio": 1,
+            "created": "2025-01-01",
+            "expires": "2026-12-31"
+        },
+        {
+            "number": "PO67890",
+            "email": "supplier-b@example.com",
+            "ratio": 2,
+            "created": "2025-06-01",
+            "expires": "2027-06-01"
+        }
+    ]
+}

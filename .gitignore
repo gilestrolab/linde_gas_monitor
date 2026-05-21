@@ -4,3 +4,6 @@ credentials.json
 credentials.mailu.json
 credentials.json
 *.png
+__pycache__/
+*.pyc
+.pytest_cache/
